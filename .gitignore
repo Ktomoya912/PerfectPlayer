@@ -13,3 +13,5 @@ db2.out
 logs/
 checkpoints/
 results/
+board_data/
+*.pth

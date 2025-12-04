@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-base_dir = Path(__file__).resolve().parent
+base_dir = Path(__file__).resolve().parent.parent
 
 # 8方向の回転・鏡面変換パターン（numpy配列化）
 ROTATE3 = np.array(
@@ -116,3 +116,11 @@ def readDB2(file_path=base_dir / "db2.out"):
     except FileNotFoundError:
         print(f"error opening file: {file_path}", file=sys.stderr)
         sys.exit(1)
+
+
+def calc_progress(board: np.ndarray):
+    """
+    ボード状態から進捗度（progress）を計算
+    各タイルの値の2の累乗和を2で割った値を返す。
+    """
+    return sum(2**i for i in board if i > 0) // 2

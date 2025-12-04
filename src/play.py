@@ -1,192 +1,251 @@
-"""
-学習済みモデルを使用してMini 2048をプレイする
-"""
-
 import argparse
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Queue
 
 import numpy as np
 import torch
 
-from agent import select_best_action
+from agent import get_values
 from config import Config
 from game_2048_3_3 import State
 from model import Mini2048_SV_Predictor
+from utils import calc_progress
+
+stop_event = threading.Event()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+queue = Queue()
+tasks = os.cpu_count() or 4
+
+SAVE_DIR = Path("board_data") / "test"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class GamePlayer:
-    def __init__(self, model_path, config=None):
+    def __init__(self, eval_func: callable):  # type: ignore
         """
         Args:
-            model_path: 学習済みモデルのパス
-            config: 設定（Noneの場合はデフォルト）
+            eval_func: 評価関数（state -> (values[4])を返す関数）
         """
-        if config is None:
-            config = Config.default()
+        self.eval_func = eval_func
+        self.turn = 0
+        self.states = []
+        self.after_states = []
+        self.evals = []
 
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # モデルの読み込み
-        logger.info(f"Loading model from {model_path}...")
-        self.model = Mini2048_SV_Predictor()
-
-        # チェックポイントを読み込む
-        checkpoint = torch.load(model_path, map_location=self.device)
-
-        # チェックポイント形式かどうかを判定
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            # チェックポイント形式（epoch情報などを含む）
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            logger.info(
-                f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}"
-            )
-        else:
-            # 通常のstate_dict形式
-            self.model.load_state_dict(checkpoint)
-
-        self.model.to(self.device)
-        self.model.eval()
-        logger.info(f"Model loaded on {self.device}")
-
-    def select_action(self, state: State):
-        """
-        最適な行動を選択
-
-        Args:
-            state: Stateオブジェクト
-
-        Returns:
-            選択された行動（0:上, 1:右, 2:下, 3:左）
-        """
-        return select_best_action(state, self.model, self.device)
-
-    def play_game(self, verbose=False):
+    def play_game(self, thread_id=0):
         """
         1ゲームをプレイ
 
         Args:
-            verbose: ログを詳細に表示するか
+            thread_id: スレッドID（ログ用）
 
         Returns:
-            (最終スコア, ターン数, 最大タイル)
+            None（結果はqueueに格納される）
         """
         state = State()
         state.initGame()
-        turn = 0
+        self.turn = 0
+        self.states = []
+        self.after_states = []
+        self.evals = []
 
-        if verbose:
-            logger.info("Game started!")
-            state.print()
-
-        while not state.isGameOver():
-            turn += 1
+        while not state.isGameOver() and not stop_event.is_set():
+            self.turn += 1
 
             # 最適な行動を選択
-            action, value = self.select_action(state)
+            values = self.eval_func(state)
+            progress = calc_progress(state.board.copy())
+            self.states.append((state.board.copy(), progress))
+            action = np.argmax(values)
+            self.evals.append((values, progress))
 
             if action is None:
                 break
 
             # 行動を実行
             state.play(action)
+            self.after_states.append(
+                (state.board.copy(), calc_progress(state.board.copy()))
+            )
             state.putNewTile()
 
-            if verbose and turn % 10 == 0:
-                action_names = ["UP", "RIGHT", "DOWN", "LEFT"]
-                logger.info(
-                    f"Turn {turn}: {action_names[action]} (Expected: {value:.2f})"
-                )
-                state.print()
-
-        # 最大タイルを計算
+        # ゲーム終了時の情報を収集
         max_tile = 2 ** np.max(state.board) if np.max(state.board) > 0 else 0
+        gameover_progress = calc_progress(state.board.copy())
 
-        if verbose:
-            logger.info(
-                f"Game Over! Score: {state.score}, Turns: {turn}, Max Tile: {max_tile}"
-            )
+        # 結果をキューに格納
+        game_data = {
+            "gameover_turn": self.turn,
+            "gameover_score": state.score,
+            "gameover_progress": gameover_progress,
+            "max_tile": max_tile,
+            "states": self.states,
+            "after_states": self.after_states,
+            "evals": self.evals,
+        }
 
-        return state.score, turn, max_tile
+        if not stop_event.is_set():
+            queue.put(game_data)
+
+        logger.debug(
+            f"Thread {thread_id}: Game finished. Score={state.score}, Turns={self.turn}"
+        )
 
 
-def play_multiple_games(model_path, num_games=100, save_stats=True):
+def create_model_eval_func(model_path, config=None):
+    """
+    モデルから評価関数を作成するヘルパー関数
+
+    Args:
+        model_path: 学習済みモデルのパス
+        config: 設定（Noneの場合はデフォルト）
+
+    Returns:
+        eval_func: 評価関数（state -> (action, value)を返す）
+    """
+    if config is None:
+        config = Config.default()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # モデルの読み込み
+    logger.info(f"Loading model from {model_path}...")
+    model = Mini2048_SV_Predictor()
+
+    # チェックポイントを読み込む
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+    # チェックポイント形式かどうかを判定
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        logger.info(
+            f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}"
+        )
+    else:
+        model.load_state_dict(checkpoint)
+
+    model.to(device)
+    model.eval()
+    logger.info(f"Model loaded on {device}")
+
+    # 評価関数を返す
+    def eval_func(state):
+        return get_values(state, model, device)
+
+    return eval_func
+
+
+def play_multiple_games(eval_func, num_games=100, save_stats=True, model_name=None):
     """
     複数ゲームをプレイして統計を取る
 
     Args:
-        model_path: モデルのパス
+        eval_func: 評価関数（state -> (values[4])を返す）
         num_games: プレイするゲーム数
         save_stats: 統計を保存するか
+        model_name: モデル名（統計保存時に使用、Noneの場合は"Custom eval function"）
     """
-    player = GamePlayer(model_path)
 
-    scores = []
-    turns = []
-    max_tiles = []
+    logger.info(f"Playing {num_games} games with {tasks} threads...")
 
-    logger.info(f"Playing {num_games} games...")
+    # 各スレッドが1ゲームずつプレイし続ける
+    def worker(thread_id):
+        while not stop_event.is_set():
+            player = GamePlayer(eval_func)
+            player.play_game(thread_id)
 
-    for i in range(num_games):
-        score, turn, max_tile = player.play_game(verbose=False)
-        scores.append(score)
-        turns.append(turn)
-        max_tiles.append(max_tile)
+    executor = ThreadPoolExecutor(max_workers=tasks)
+    futures = []
+    for i in range(tasks):
+        futures.append(executor.submit(worker, i))
 
-        if (i + 1) % 10 == 0:
-            logger.info(f"Completed {i + 1}/{num_games} games")
+    data = []
+    try:
+        while len(data) < num_games:
+            game_data = queue.get(timeout=300)  # 5分のタイムアウト
+            data.append(game_data)
+            if len(data) % 10 == 0 or len(data) == num_games:
+                logger.info(f"Collected {len(data)}/{num_games} games.")
+    except Exception as e:
+        logger.error(f"Error collecting game data: {e}")
+    finally:
+        # 停止シグナルを送信
+        stop_event.set()
+        executor.shutdown(wait=True, cancel_futures=True)
 
-    # 統計を計算
-    scores_array = np.array(scores)
-    turns_array = np.array(turns)
-    max_tiles_array = np.array(max_tiles)
+    logger.info(f"Played {num_games} games.")
 
+    if not data:
+        logger.error("No game data collected!")
+        return
+
+    scores = [game_data["gameover_score"] for game_data in data]
+    turns = [game_data["gameover_turn"] for game_data in data]
+    max_tiles = [game_data["max_tile"] for game_data in data]
+
+    # 統計を表示
     logger.info("\n=== Game Statistics ===")
-    logger.info(f"Games played: {num_games}")
-    logger.info(
-        f"Average Score: {np.mean(scores_array):.2f} ± {np.std(scores_array):.2f}"
-    )
-    logger.info(f"Median Score: {np.median(scores_array):.0f}")
-    logger.info(f"Max Score: {np.max(scores_array)}")
-    logger.info(f"Min Score: {np.min(scores_array)}")
-    logger.info(f"Average Turns: {np.mean(turns_array):.2f}")
+    logger.info(f"Games played: {len(data)}")
+    logger.info(f"Average Score: {np.mean(scores):.2f} ± {np.std(scores):.2f}")
+    logger.info(f"Median Score: {np.median(scores):.0f}")
+    logger.info(f"Max Score: {np.max(scores)}")
+    logger.info(f"Min Score: {np.min(scores)}")
+    logger.info(f"Average Turns: {np.mean(turns):.2f}")
     logger.info("Max Tile Distribution:")
-    unique_tiles, counts = np.unique(max_tiles_array, return_counts=True)
+    unique_tiles, counts = np.unique(max_tiles, return_counts=True)
     for tile, count in zip(unique_tiles, counts):
-        logger.info(f"  {tile}: {count} ({count / num_games * 100:.1f}%)")
+        logger.info(f"  {tile}: {count} ({count / len(data) * 100:.1f}%)")
 
-    # 統計をファイルに保存
+    # ゲームデータを保存
     if save_stats:
-        stats_dir = Path("results")
-        stats_dir.mkdir(exist_ok=True)
+        try:
+            with (
+                open(SAVE_DIR / "state.txt", "w") as f_state,
+                open(SAVE_DIR / "eval.txt", "w") as f_eval,
+                open(SAVE_DIR / "after-state.txt", "w") as f_after,
+            ):
+                for i, game_data in enumerate(data):
+                    states = game_data["states"]
+                    after_states = game_data["after_states"]
+                    evals = game_data["evals"]
+                    gameover_info = f"gameover_turn: {game_data['gameover_turn']}; game: {i + 1}; progress: {game_data['gameover_progress']}; score: {game_data['gameover_score']}"
 
-        stats_file = stats_dir / "play_stats.txt"
-        with open(stats_file, "w") as f:
-            f.write(f"Model: {model_path}\n")
-            f.write(f"Games: {num_games}\n\n")
-            f.write(
-                f"Average Score: {np.mean(scores_array):.2f} ± {np.std(scores_array):.2f}\n"
-            )
-            f.write(f"Median Score: {np.median(scores_array):.0f}\n")
-            f.write(f"Max Score: {np.max(scores_array)}\n")
-            f.write(f"Min Score: {np.min(scores_array)}\n")
-            f.write(f"Average Turns: {np.mean(turns_array):.2f}\n\n")
-            f.write("Max Tile Distribution:\n")
-            for tile, count in zip(unique_tiles, counts):
-                f.write(f"  {tile}: {count} ({count / num_games * 100:.1f}%)\n")
+                    state_strs = []
+                    eval_strs = []
+                    after_state_strs = []
+                    for state, after_state, eval_data in zip(
+                        states, after_states, evals
+                    ):
+                        state_str = f"{' '.join(map(str, state[0]))} {state[1]}"
+                        after_state_str = (
+                            f"{' '.join(map(str, after_state[0]))} {after_state[1]}"
+                        )
+                        # eval_data[0]がリストか単一値かによって処理を分岐
+                        if isinstance(eval_data[0], (list, tuple, np.ndarray)):
+                            eval_str = f"{' '.join(str(float(ev)) for ev in eval_data[0])} {eval_data[1]}"
+                        else:
+                            eval_str = f"{float(eval_data[0])} {eval_data[1]}"
+                        state_strs.append(state_str)
+                        eval_strs.append(eval_str)
+                        after_state_strs.append(after_state_str)
+                    # 1ゲーム分のデータを追記
+                    f_state.write("\n".join(state_strs) + f"\n{gameover_info}\n")
+                    f_eval.write("\n".join(eval_strs) + f"\n{gameover_info}\n")
+                    f_after.write("\n".join(after_state_strs) + f"\n{gameover_info}\n")
 
-        # 各ゲームの詳細を保存
-        details_file = stats_dir / "game_details.csv"
-        with open(details_file, "w") as f:
-            f.write("game_id,score,turns,max_tile\n")
-            for i, (score, turn, max_tile) in enumerate(zip(scores, turns, max_tiles)):
-                f.write(f"{i + 1},{score},{turn},{max_tile}\n")
+            logger.info(f"Game data saved to {SAVE_DIR}/")
+        except Exception as e:
+            logger.error(f"Error saving game data: {e}")
+            return
 
-        logger.info(f"\nStatistics saved to {stats_dir}/")
+    logger.info("End Free Play")
 
 
 def main():
@@ -200,22 +259,10 @@ def main():
     parser.add_argument(
         "--num-games", type=int, default=100, help="Number of games to play"
     )
-    parser.add_argument(
-        "--single", action="store_true", help="Play a single game with verbose output"
-    )
 
     args = parser.parse_args()
-
-    if args.single:
-        # 1ゲームを詳細に表示
-        player = GamePlayer(args.model)
-        score, turns, max_tile = player.play_game(verbose=True)
-        logger.info(
-            f"\nFinal Result: Score={score}, Turns={turns}, Max Tile={max_tile}"
-        )
-    else:
-        # 複数ゲームをプレイして統計を取る
-        play_multiple_games(args.model, num_games=args.num_games)
+    eval_func = create_model_eval_func(args.model)
+    play_multiple_games(eval_func, num_games=args.num_games, model_name=args.model)
 
 
 if __name__ == "__main__":

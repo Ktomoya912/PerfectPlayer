@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from agent import select_best_action
+from agent import get_values
 from config import Config
 from dataset import AfterstateDataset
 from game_2048_3_3 import State
@@ -16,8 +16,8 @@ from model import Mini2048_SV_Predictor
 def get_initial_evaluation_score(model, device):
     state = State()
     state.initGame()
-    action, value = select_best_action(state, model, device)
-    return value
+    values = get_values(state, model, device)
+    return max(values)
 
 
 def evaluate_model(model, device, num_games=10):
@@ -41,7 +41,8 @@ def evaluate_model(model, device, num_games=10):
             state.initGame()
 
             while not state.isGameOver():
-                best_action, _ = select_best_action(state, model, device)
+                values = get_values(state, model, device)
+                best_action = np.argmax(values)
 
                 if best_action is None:
                     break
@@ -74,7 +75,7 @@ def train():
         train_dataset,
         batch_size=config.training.batch_size,
         shuffle=True,
-        num_workers=4,  # シングルプロセスでメモリリークを防止
+        num_workers=4,
         pin_memory=True if torch.cuda.is_available() else False,  # GPU転送の高速化
     )
     logger.info(f"Dataset size: {len(train_dataset)}")
@@ -87,7 +88,7 @@ def train():
     logger.info("Initializing model...")
     model = Mini2048_SV_Predictor()
 
-    # MSE Loss（正規化されたスコアを予測）
+    # MSE Loss
     criterion = nn.MSELoss()
     logger.info("Using MSE Loss for regression")
 
@@ -104,11 +105,32 @@ def train():
     checkpoint_dir = Path(config.training.checkpoint_dir)
     checkpoint_dir.mkdir(exist_ok=True)
 
+    # チェックポイントから再開
+    start_epoch = 0
+    global_batch_count = 0
+    checkpoint_files = sorted(
+        checkpoint_dir.glob("model_epoch_*.pth"),
+        key=lambda x: int(x.stem.split("_")[-1]),
+    )
+    if checkpoint_files:
+        latest_checkpoint = checkpoint_files[-1]
+        logger.info(f"Loading checkpoint from {latest_checkpoint}...")
+        checkpoint = torch.load(
+            latest_checkpoint, map_location=device, weights_only=False
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        # グローバルバッチカウントを推定（概算）
+        global_batch_count = start_epoch * len(train_loader)
+        logger.info(f"Resuming from epoch {start_epoch}, batch {global_batch_count}")
+    else:
+        logger.info("No checkpoint found. Starting from scratch.")
+
     # 3. トレーニングの実行
     logger.info("Starting Supervised Learning Training...")
-    global_batch_count = 0  # グローバルなバッチカウンター
 
-    for epoch in range(config.training.epochs):
+    for epoch in range(start_epoch, config.training.epochs):
         model.train()
         total_loss = 0
 

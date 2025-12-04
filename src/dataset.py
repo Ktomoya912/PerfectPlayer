@@ -6,7 +6,7 @@ from utils import index_to_onehot, readDB2
 
 
 class AfterstateDataset(Dataset):
-    def __init__(self, db_path="db2.out", max_score=6000.0):
+    def __init__(self, db_path="db2.out"):
         """
         db2.outから遅延ロードでデータを読み込むデータセット
 
