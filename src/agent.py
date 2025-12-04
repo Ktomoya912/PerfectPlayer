@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from game_2048_3_3 import State
@@ -14,17 +15,18 @@ def get_values(state: State, model, device):
         device: デバイス（'cuda' or 'cpu'）
 
     Returns:
-        (best_action, best_value): 最適な行動とその評価値
+        (values, sub_values): 各行動モデルの評価値、行動によるスコア増分
     """
-    values = [-1e10] * 4
+    values = np.array([-1e10] * 4, dtype=np.float32)
+    sub_values = np.array([-1e10] * 4, dtype=np.float32)
     # 各方向について評価
     for action in range(4):
-        if not state.canMoveTo(action):
-            continue
-
         # 仮想的に行動を実行
         temp_state = state.clone()
         temp_state.play(action)
+        sub_values[action] = temp_state.score - state.score
+        if not state.canMoveTo(action):
+            continue
 
         # 正規化された盤面をone-hotエンコーディングに変換
         state_index = board_to_index(temp_state.board)
@@ -37,4 +39,4 @@ def get_values(state: State, model, device):
             value = model(state_tensor).item()
             values[action] = value
 
-    return values
+    return values, sub_values

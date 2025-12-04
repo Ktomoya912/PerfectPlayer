@@ -16,7 +16,7 @@ from model import Mini2048_SV_Predictor
 def get_initial_evaluation_score(model, device):
     state = State()
     state.initGame()
-    values = get_values(state, model, device)
+    values, _ = get_values(state, model, device)
     return max(values)
 
 
@@ -41,7 +41,7 @@ def evaluate_model(model, device, num_games=10):
             state.initGame()
 
             while not state.isGameOver():
-                values = get_values(state, model, device)
+                values, _ = get_values(state, model, device)
                 best_action = np.argmax(values)
 
                 if best_action is None:

@@ -137,7 +137,8 @@ def create_model_eval_func(model_path, config=None):
 
     # 評価関数を返す
     def eval_func(state):
-        return get_values(state, model, device)
+        v, _ = get_values(state, model, device)
+        return v
 
     return eval_func
 

@@ -1,11 +1,12 @@
 import random
 import sys
+from typing import Union
 
 import numpy
 
 
 class State:
-    def __init__(self, bd: "State" = None, sc: int | None = None):
+    def __init__(self, bd: Union["numpy.ndarray", None] = None, sc: int | None = None):
         self.board: numpy.ndarray = (
             bd if bd is not None else numpy.zeros([9], dtype="int64")
         )
@@ -23,7 +24,7 @@ class State:
     def print(self, fp=sys.stdout):
         for j in range(3):
             for i in range(3):
-                print(f"{self.board[j*3+i]:3d}", end="", file=fp)
+                print(f"{self.board[j * 3 + i]:3d}", end="", file=fp)
             print("", file=fp)
         print(f"score = {self.score}", file=fp)
 
@@ -222,7 +223,7 @@ def test2():
         canMoveDirs = [i for i in range(4) if bd.canMoveTo(i)]
         print(f"canMoveDirs = {canMoveDirs}")
         d = random.choice(canMoveDirs)
-        print(f'selectedDir = {["up", "right", "down", "left"][d]}')
+        print(f"selectedDir = {['up', 'right', 'down', 'left'][d]}")
         bd.play(d)
         bd.putNewTile()
 

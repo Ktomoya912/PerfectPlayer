@@ -57,7 +57,7 @@ def index_to_board(index):
     return board
 
 
-def board_to_index(board):
+def board_to_index(board: np.ndarray):
     """正規化されていないboardから正規化を行った後のindexを計算する関数(numpyを用いた高速な関数)"""
 
     # boardをnumpy配列に変換（既にnumpy配列の場合はそのまま）
@@ -107,7 +107,7 @@ def readDB2(file_path=base_dir / "db2.out"):
             evs = struct.unpack(f"{count}d", evs_data)
 
             # Populate db dictionary
-            db = {}
+            db: dict[int, float] = {}
             for i in range(count):
                 db[ids[i]] = evs[i]
 

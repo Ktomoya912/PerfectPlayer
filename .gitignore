@@ -15,3 +15,4 @@ checkpoints/
 results/
 board_data/
 *.pth
+perfect.db
